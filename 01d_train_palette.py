@@ -14,6 +14,7 @@ Key Difference from GANs:
 import os
 import json
 import math
+import copy #this was added
 import torch
 import rasterio
 import numpy as np
@@ -40,6 +41,8 @@ T = 1000          # Number of diffusion timesteps (standard)
 BETA_START = 1e-4
 BETA_END = 0.02
 INFERENCE_STEPS = 10  # Reduced from 50 — faster validation visuals, no impact on training quality
+EMA_DECAY = 0.9999    # Exponential Moving Average decay — smooths weights for stable inference
+GRAD_CLIP_NORM = 1.0  # Max gradient norm — prevents NaN explosions in early training
 
 os.makedirs(OUTPUT_IMAGES, exist_ok=True)
 logging.basicConfig(
@@ -338,6 +341,13 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     scaler = torch.amp.GradScaler('cuda')
 
+    # EMA (Exponential Moving Average) — maintains a smoothed copy of weights for stable inference.
+    # Standard practice for all production diffusion models (Stable Diffusion, DALL·E, Imagen).
+    # Instead of using raw training weights (which bounce with SGD noise), the EMA copy
+    # updates slowly: ema_weight = 0.9999 * ema_weight + 0.0001 * current_weight
+    ema_model = copy.deepcopy(model)
+    ema_model.eval()  # EMA model is never trained directly, only used for inference
+
     # Pre-compute diffusion schedule
     betas = linear_beta_schedule(T, BETA_START, BETA_END)
     diffusion_params = get_diffusion_params(betas)
@@ -351,6 +361,13 @@ def main():
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scaler.load_state_dict(ckpt['scaler'])
+        if 'ema_model' in ckpt:
+            ema_model.load_state_dict(ckpt['ema_model'])
+            logging.info("EMA weights restored from checkpoint.")
+        else:
+            # Legacy checkpoint without EMA — initialize EMA from current model
+            ema_model.load_state_dict(model.state_dict())
+            logging.info("No EMA in checkpoint (legacy). Initializing EMA from current model weights.")
         start_epoch = ckpt['epoch'] + 1
         logging.info(f"Resuming from Epoch {start_epoch + 1}")
     elif os.path.exists(CHECKPOINT_FILE) and not args.resume:
@@ -392,8 +409,21 @@ def main():
                 loss = F.mse_loss(predicted_noise, noise)
 
             scaler.scale(loss).backward()
+
+            # GRADIENT CLIPPING — prevents the NaN explosions that killed epoch 1 last time.
+            # Unscale gradients first (required before clip when using GradScaler),
+            # then clip to max_norm=1.0 so no single batch can blow up the weights.
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+
             scaler.step(optimizer)
             scaler.update()
+
+            # EMA UPDATE — after each optimizer step, slowly blend new weights into the EMA copy.
+            # With decay=0.9999, EMA changes by only 0.01% per step, producing very smooth weights.
+            with torch.no_grad():
+                for ema_p, model_p in zip(ema_model.parameters(), model.parameters()):
+                    ema_p.data.mul_(EMA_DECAY).add_(model_p.data, alpha=1.0 - EMA_DECAY)
 
             total_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
@@ -402,7 +432,9 @@ def main():
         logging.info(f"Epoch {epoch + 1} Complete. Average MSE Loss: {avg_loss:.6f}")
 
         # --- Generate Validation Visual Progress with Guided DDIM ---
-        model.eval()
+        # Use EMA model for validation visuals — this is the model that will be used for inference,
+        # so we want to see what IT produces, not what the noisy training weights produce.
+        ema_model.eval()
         with torch.no_grad():
             for i, (sar, real_opt) in enumerate(val_loader):
                 if i > 0:
@@ -410,8 +442,8 @@ def main():
                 sar = sar.to(device)
                 real_opt = real_opt.to(device)
 
-                # Generate fake optical images via Guided DDIM (25 steps, CFG scale 2.0)
-                fake_opt = p_sample_loop(model, sar[:4], diffusion_params, device, num_steps=25, guidance_scale=2.0)
+                # Generate fake optical images via Guided DDIM using EMA model (25 steps, CFG scale 2.0)
+                fake_opt = p_sample_loop(ema_model, sar[:4], diffusion_params, device, num_steps=25, guidance_scale=2.0)
 
                 # Rescale from [-1.0, 1.0] to [0.0, 1.0] for saving
                 real_vis = ((real_opt[:4] + 1.0) / 2.0).clamp(0.0, 1.0)
@@ -420,26 +452,29 @@ def main():
                 img_sample = torch.cat((real_vis.data, fake_vis.data), -2)
                 save_image(img_sample, OUTPUT_IMAGES / f"epoch_{epoch + 1}.png", nrow=4, normalize=False)
 
-        # --- SAVE CHECKPOINT ---
+        # --- SAVE CHECKPOINT (includes EMA weights for safe resume) ---
         ckpt = {
             'epoch': epoch,
             'model': model.state_dict(),
+            'ema_model': ema_model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scaler': scaler.state_dict(),
         }
         torch.save(ckpt, CHECKPOINT_FILE)
 
-        # --- SAVE BEST MODEL (lowest validation noise loss) ---
+        # --- SAVE BEST MODEL — always save EMA weights, not raw training weights ---
+        # EMA weights are what we use for inference (fake image generation),
+        # so the "best model" should be the best EMA, not the best raw model.
         if avg_loss < best_val_loss:
             best_val_loss = avg_loss
-            torch.save(model.state_dict(), BEST_MODEL)
-            logging.info(f"New best model saved at Epoch {epoch + 1}! Val Loss: {best_val_loss:.6f} -> {BEST_MODEL}")
+            torch.save(ema_model.state_dict(), BEST_MODEL)
+            logging.info(f"New best EMA model saved at Epoch {epoch + 1}! Val Loss: {best_val_loss:.6f} -> {BEST_MODEL}")
         else:
             logging.info("Checkpoint saved safely.")
 
-    # Export the final epoch weights (for comparison against best)
-    torch.save(model.state_dict(), FINAL_MODEL)
-    logging.info(f"Training finished! Final model: {FINAL_MODEL} | Best model: {BEST_MODEL} (lowest val loss: {best_val_loss:.6f})")
+    # Export the final epoch EMA weights (for comparison against best)
+    torch.save(ema_model.state_dict(), FINAL_MODEL)
+    logging.info(f"Training finished! Final EMA model: {FINAL_MODEL} | Best EMA model: {BEST_MODEL} (lowest val loss: {best_val_loss:.6f})")
 
 
 if __name__ == "__main__":
