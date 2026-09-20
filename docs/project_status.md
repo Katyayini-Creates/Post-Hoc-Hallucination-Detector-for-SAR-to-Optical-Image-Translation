@@ -1,7 +1,7 @@
 # Post-Hoc Hallucination Detector for SAR-to-Optical Image Translation
 ### Project Status Documentation
 
-**Capstone Reference:** CAP-CSE-2025-SAR-01 | School of Computer Science (SOCS), UPES
+**Capstone Reference:** School of Computer Science (SOCS), UPES
 **Team:** Ananya Karn (CCVT B3) · Hiten Gupta (DevOps B1) · Katyayini Singh (CSF B4) · Vyansh Sinha (DevOps B1)
 **Repository:** `Post-Hoc-Hallucination-Detector-for-SAR-to-Optical-Image-Translation`
 
